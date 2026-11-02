@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Nagrywa strumień HLS ruutu-free-01 w najwyższej jakości do MP4 w bieżącym katalogu,
-# przez tunel SOCKS5 na 127.0.0.1:7654. Bez rekodowania (remux TS -> MP4).
-# Użycie: ./rec.sh URL_M3U8 [NAZWA]
-#   ./rec.sh "https://.../hls-index.m3u8?..." mecz
-# URL z tokenem weź z `ruutu_dl.py --url-only ...` (pole streamUrls.webHls.url w media API).
-# Tokeny wygasają po ~24 h i są przypięte do IP, które wywołało media API.
-# Przerwanie: Ctrl+C. MP4 jest fragmentowany, więc plik jest poprawny także po przerwaniu.
+# Records a live HLS stream to a fragmented MP4 in the current directory through a SOCKS5 tunnel
+# on 127.0.0.1:7654, using streamlink + ffmpeg (no re-encoding). Alternative to ruutu_dl.py.
+# Usage: ./rec.sh M3U8_URL [NAME]
+#   ./rec.sh "https://.../hls-index.m3u8?..." match
+# Get the tokenized URL from `ruutu_dl.py --url-only ...` (streamUrls.webHls.url in the media API).
+# Tokens expire after ~24 h and are bound to the IP that called the media API.
+# Stop with Ctrl+C. The MP4 is fragmented, so the file stays valid even when interrupted.
 set -euo pipefail
 
 if [[ $# -lt 1 || -z "$1" ]]; then
-  echo "Użycie: $0 URL_M3U8 [NAZWA]" >&2
+  echo "Usage: $0 M3U8_URL [NAME]" >&2
   exit 2
 fi
 URL="$1"
@@ -20,17 +20,17 @@ STREAMLINK="$HOME/.local/bin/streamlink"
 
 for bin in "$STREAMLINK" ffmpeg; do
   if ! command -v "$bin" >/dev/null 2>&1; then
-    echo "Brak: $bin" >&2
+    echo "Missing: $bin" >&2
     exit 1
   fi
 done
 
 if ! nc -z 127.0.0.1 7654 2>/dev/null; then
-  echo "Tunel SOCKS na 127.0.0.1:7654 nie odpowiada" >&2
+  echo "SOCKS tunnel on 127.0.0.1:7654 is not responding" >&2
   exit 1
 fi
 
-echo "Nagrywam do: $OUT"
+echo "Recording to: $OUT"
 "$STREAMLINK" \
   --http-proxy "$PROXY" \
   --http-header "Referer=https://www.ruutu.fi/" \
