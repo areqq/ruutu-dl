@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import http.client
 import http.server
 import json
@@ -446,19 +447,25 @@ def drop_attributes(tag_line: str, names: tuple[str, ...]) -> str:
     return tag_line.replace(":,", ":")
 
 
-def build_best_master(master_url: str, text: str) -> str:
-    """Builds a master playlist that contains only the highest-bandwidth variant and its audio renditions.
+@dataclass(frozen=True)
+class SelectedStreams:
+    """Best variant of a master playlist, its separate audio rendition (if any) and a filtered master
+    that contains only those, with absolute URIs so the relay can rewrite them."""
 
-    Players and ffmpeg then get exactly one program: best video plus matching audio (VOD keeps audio in a
-    separate #EXT-X-MEDIA rendition). Subtitles are dropped. URIs are made absolute so the relay can rewrite them.
-    """
+    video_url: str
+    audio_url: str | None
+    filtered_master: str
+
+
+def select_streams(master_url: str, text: str) -> SelectedStreams:
     variants = parse_master_playlist(master_url, text)
     if not variants:
-        return text
+        return SelectedStreams(master_url, None, text)
     best = max(variants, key=lambda v: v.bandwidth)
     listing = ", ".join(f"{v.resolution}@{v.bandwidth // 1000}k" for v in sorted(variants, key=lambda v: v.bandwidth))
     print(f"HLS variants: {listing}. Using {best.resolution}@{best.bandwidth // 1000}k.", file=sys.stderr)
 
+    audio_url: str | None = None
     lines = ["#EXTM3U"]
     for line in text.splitlines():
         line = line.strip()
@@ -469,8 +476,302 @@ def build_best_master(master_url: str, text: str) -> str:
             if attrs.get("TYPE") == "AUDIO" and attrs.get("GROUP-ID") == best.audio_group and attrs.get("URI"):
                 absolute = urljoin(master_url, attrs["URI"])
                 lines.append(re.sub(r'URI="[^"]*"', f'URI="{absolute}"', line))
+                if audio_url is None or attrs.get("DEFAULT") == "YES":
+                    audio_url = absolute
     lines += [best.stream_inf, best.url]
-    return "\n".join(lines) + "\n"
+    return SelectedStreams(best.url, audio_url, "\n".join(lines) + "\n")
+
+
+@dataclass(frozen=True)
+class Segment:
+    url: str
+    duration: float
+    sequence: int
+
+
+@dataclass(frozen=True)
+class MediaPlaylist:
+    init_url: str | None
+    segments: list[Segment]
+    target_duration: float
+    ended: bool
+
+    @property
+    def fragmented_mp4(self) -> bool:
+        return self.init_url is not None
+
+
+def parse_media_playlist(playlist_url: str, text: str) -> MediaPlaylist:
+    init_url: str | None = None
+    segments: list[Segment] = []
+    target = 6.0
+    sequence = 0
+    duration: float | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            init_url = urljoin(playlist_url, parse_attributes(line[len("#EXT-X-MAP:"):]).get("URI", ""))
+        elif line.startswith("#EXT-X-TARGETDURATION:"):
+            target = float(line.split(":", 1)[1])
+        elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            sequence = int(line.split(":", 1)[1])
+        elif line.startswith("#EXTINF:"):
+            duration = float(line.split(":", 1)[1].split(",", 1)[0])
+        elif line and not line.startswith("#"):
+            segments.append(Segment(urljoin(playlist_url, line), duration or target, sequence))
+            sequence += 1
+            duration = None
+    return MediaPlaylist(init_url, segments, target, "#EXT-X-ENDLIST" in text)
+
+
+def fetch_media_playlist(session: Session, url: str) -> MediaPlaylist:
+    resp = session.request("GET", url, headers=STREAM_HEADERS)
+    if resp.status != 200:
+        raise RuntimeError(f"Media playlist returned HTTP {resp.status}: {resp.body[:200]!r}")
+    return parse_media_playlist(url, resp.text())
+
+
+def fetch_bytes(session: Session, url: str) -> bytes:
+    for attempt in range(3):
+        try:
+            resp = session.request("GET", url, headers=STREAM_HEADERS)
+        except (OSError, ConnectionError) as exc:
+            if attempt == 2:
+                raise
+            print(f"\nRetrying segment after error: {exc}", file=sys.stderr)
+            continue
+        if resp.status == 200:
+            return resp.body
+        if attempt == 2 or resp.status < 500:
+            raise RuntimeError(f"Segment returned HTTP {resp.status}: {url[-80:]}")
+    raise RuntimeError("unreachable")
+
+
+class Progress:
+    def __init__(self, total_segments: int | None) -> None:
+        self.total = total_segments
+        self.done = 0
+        self.bytes = 0
+        self.seconds = 0.0
+        self.started = time.monotonic()
+
+    def step(self, size: int, seconds: float) -> None:
+        self.done += 1
+        self.bytes += size
+        self.seconds += seconds
+        elapsed = max(time.monotonic() - self.started, 1e-6)
+        total = f"/{self.total}" if self.total else ""
+        print(
+            f"\rsegments {self.done}{total}  {self.bytes / (1 << 20):8.1f} MiB  "
+            f"{self.seconds:7.0f} s of media  {self.bytes / elapsed / (1 << 20):5.1f} MiB/s",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def finish(self) -> None:
+        print(file=sys.stderr)
+
+
+# --- MP4 (ISO BMFF) helpers: enough to merge two single-track fragmented MP4 streams into one file -------------
+
+
+@dataclass(frozen=True)
+class Box:
+    type: bytes
+    start: int
+    end: int
+    header: int
+
+    @property
+    def payload(self) -> slice:
+        return slice(self.start + self.header, self.end)
+
+
+def iter_boxes(data: bytes, start: int = 0, end: int | None = None) -> list[Box]:
+    end = len(data) if end is None else end
+    boxes: list[Box] = []
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos : pos + 4], "big")
+        box_type = data[pos + 4 : pos + 8]
+        header = 8
+        if size == 1:
+            size = int.from_bytes(data[pos + 8 : pos + 16], "big")
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header:
+            raise RuntimeError(f"Corrupt MP4 box {box_type!r} at offset {pos}")
+        boxes.append(Box(box_type, pos, pos + size, header))
+        pos += size
+    return boxes
+
+
+def child_box(data: bytes, parent: Box, box_type: bytes) -> Box | None:
+    return next((b for b in iter_boxes(data, parent.start + parent.header, parent.end) if b.type == box_type), None)
+
+
+def make_box(box_type: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), box_type) + payload
+
+
+def fullbox_track_id_offset(data: bytes, box: Box) -> int:
+    """Offset of track_ID inside tkhd: after version/flags, creation and modification times (32 or 64 bit)."""
+    version = data[box.start + box.header]
+    return box.start + box.header + (4 + 16 if version == 1 else 4 + 8)
+
+
+def set_u32(data: bytearray, offset: int, value: int) -> None:
+    data[offset : offset + 4] = value.to_bytes(4, "big")
+
+
+@dataclass
+class InitSegment:
+    ftyp: bytes
+    mvhd: bytes
+    trak: bytes
+    trex: bytes
+
+    @staticmethod
+    def parse(data: bytes, new_track_id: int) -> InitSegment:
+        top = {b.type: b for b in iter_boxes(data)}
+        moov = top.get(b"moov")
+        if moov is None:
+            raise RuntimeError("Init segment has no moov box")
+        mvhd, trak, mvex = (child_box(data, moov, t) for t in (b"mvhd", b"trak", b"mvex"))
+        if mvhd is None or trak is None or mvex is None:
+            raise RuntimeError("Init segment moov lacks mvhd/trak/mvex")
+        trex = child_box(data, mvex, b"trex")
+        tkhd = child_box(data, trak, b"tkhd")
+        if trex is None or tkhd is None:
+            raise RuntimeError("Init segment lacks trex/tkhd")
+        buf = bytearray(data)
+        set_u32(buf, fullbox_track_id_offset(data, tkhd), new_track_id)
+        set_u32(buf, trex.start + trex.header + 4, new_track_id)
+        ftyp = top.get(b"ftyp")
+        return InitSegment(
+            ftyp=bytes(buf[ftyp.start : ftyp.end]) if ftyp else make_box(b"ftyp", b"iso6\x00\x00\x00\x01iso6cmfc"),
+            mvhd=bytes(buf[mvhd.start : mvhd.end]),
+            trak=bytes(buf[trak.start : trak.end]),
+            trex=bytes(buf[trex.start : trex.end]),
+        )
+
+
+def build_moov(video: InitSegment, audio: InitSegment | None) -> bytes:
+    mvhd = bytearray(video.mvhd)
+    set_u32(mvhd, len(mvhd) - 4, 3 if audio else 2)
+    traks = video.trak + (audio.trak if audio else b"")
+    mvex = make_box(b"mvex", video.trex + (audio.trex if audio else b""))
+    return make_box(b"moov", bytes(mvhd) + traks + mvex)
+
+
+def rewrite_fragment(data: bytes, track_id: int, sequence: int) -> bytes:
+    """Keeps only moof/mdat boxes, sets tfhd track_ID and mfhd sequence_number. Sizes never change,
+    so trun data offsets stay valid."""
+    buf = bytearray(data)
+    out = bytearray()
+    for box in iter_boxes(data):
+        if box.type == b"moof":
+            for child in iter_boxes(data, box.start + box.header, box.end):
+                if child.type == b"mfhd":
+                    set_u32(buf, child.start + child.header + 4, sequence)
+                elif child.type == b"traf":
+                    tfhd = child_box(data, child, b"tfhd")
+                    if tfhd is not None:
+                        set_u32(buf, tfhd.start + tfhd.header + 4, track_id)
+            out += buf[box.start : box.end]
+        elif box.type == b"mdat":
+            out += buf[box.start : box.end]
+    return bytes(out)
+
+
+# --- stdlib downloaders -------------------------------------------------------------------------------------------
+
+
+def download_vod(session: Session, video: MediaPlaylist, audio: MediaPlaylist | None, output: Path) -> Path:
+    """Pure-Python VOD download. Fragmented MP4 tracks are merged into one MP4; MPEG-TS segments are concatenated."""
+    if not video.fragmented_mp4:
+        if audio is not None:
+            raise RuntimeError("MPEG-TS video with separate audio needs ffmpeg to be muxed into one file.")
+        output = output.with_suffix(".ts")
+        print(f"MPEG-TS segments: concatenating into {output}", file=sys.stderr)
+        concatenate_segments(session, video, output)
+        return output
+    if audio is not None and not audio.fragmented_mp4:
+        raise RuntimeError("Mixed fMP4 video and MPEG-TS audio needs ffmpeg.")
+
+    output = output.with_suffix(".mp4")
+    video_init = InitSegment.parse(fetch_bytes(session, video.init_url or ""), 1)
+    audio_init = InitSegment.parse(fetch_bytes(session, audio.init_url or ""), 2) if audio else None
+    total = len(video.segments) + (len(audio.segments) if audio else 0)
+    progress = Progress(total)
+    sequence = 1
+    with output.open("wb") as fh, concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        fh.write(video_init.ftyp + build_moov(video_init, audio_init))
+        video_futures = [pool.submit(fetch_bytes, session, s.url) for s in video.segments]
+        audio_futures = [pool.submit(fetch_bytes, session, s.url) for s in audio.segments] if audio else []
+        for index in range(max(len(video_futures), len(audio_futures))):
+            for futures, playlist, track_id in ((video_futures, video, 1), (audio_futures, audio, 2)):
+                if playlist is None or index >= len(futures):
+                    continue
+                data = futures[index].result()
+                fh.write(rewrite_fragment(data, track_id, sequence))
+                sequence += 1
+                progress.step(len(data), playlist.segments[index].duration if track_id == 1 else 0.0)
+    progress.finish()
+    return output
+
+
+def concatenate_segments(session: Session, playlist: MediaPlaylist, output: Path) -> None:
+    progress = Progress(len(playlist.segments))
+    with output.open("wb") as fh, concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for segment, future in zip(playlist.segments, [pool.submit(fetch_bytes, session, s.url) for s in playlist.segments]):
+            data = future.result()
+            fh.write(data)
+            progress.step(len(data), segment.duration)
+    progress.finish()
+
+
+def record_live(
+    session: Session,
+    playlist_url: str,
+    output: Path,
+    duration: int | None,
+    from_start: bool,
+) -> Path:
+    """Pure-Python live recording: follows the playlist and appends new segments until Ctrl+C,
+    --duration, or #EXT-X-ENDLIST. MPEG-TS goes to .ts; single-track fMP4 goes to .mp4."""
+    playlist = fetch_media_playlist(session, playlist_url)
+    output = output.with_suffix(".mp4" if playlist.fragmented_mp4 else ".ts")
+    print(f"Live: recording to {output} until Ctrl+C" + (f" or for {duration}s" if duration else ""), file=sys.stderr)
+    progress = Progress(None)
+    last_sequence: int | None = None
+    with output.open("wb") as fh:
+        if playlist.init_url:
+            fh.write(fetch_bytes(session, playlist.init_url))
+        try:
+            while True:
+                if last_sequence is None:
+                    pending = playlist.segments if from_start else playlist.segments[-3:]
+                else:
+                    pending = [s for s in playlist.segments if s.sequence > last_sequence]
+                for segment in pending:
+                    data = fetch_bytes(session, segment.url)
+                    fh.write(data)
+                    last_sequence = segment.sequence
+                    progress.step(len(data), segment.duration)
+                    if duration and progress.seconds >= duration:
+                        progress.finish()
+                        return output
+                if playlist.ended:
+                    break
+                time.sleep(max(1.0, playlist.target_duration / 2))
+                playlist = fetch_media_playlist(session, playlist_url)
+        except KeyboardInterrupt:
+            print("\nInterrupted, file is complete up to the last written segment.", file=sys.stderr)
+    progress.finish()
+    return output
 
 
 class HlsRelay(http.server.ThreadingHTTPServer):
@@ -646,6 +947,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--relogin", action="store_true", help="ignore cached tokens and log in again")
     parser.add_argument("--ffmpeg", default=shutil.which("ffmpeg"), help="path to ffmpeg (default: from PATH)")
+    parser.add_argument(
+        "--no-ffmpeg",
+        action="store_true",
+        help="pure-Python download even if ffmpeg exists: VOD -> MP4 (fMP4 merge), live -> .ts",
+    )
+    parser.add_argument("--from-start", action="store_true", help="live: start from the beginning of the playlist instead of the live edge")
     parser.add_argument("--debug", action="store_true", help="print status and key headers of every HTTP response")
     return parser
 
@@ -656,8 +963,9 @@ def main() -> int:
     print(f"Proxy: {proxy.url if proxy else 'none (direct connection)'}", file=sys.stderr)
     media_id: str = args.url
     output: Path = args.output or Path.cwd() / f"ruutu-{media_id}.mp4"
-    if not args.url_only and args.ffmpeg is None:
-        raise RuntimeError("ffmpeg not found. Install it (brew install ffmpeg) or pass --ffmpeg /path/to/ffmpeg.")
+    ffmpeg: str | None = None if args.no_ffmpeg else args.ffmpeg
+    if ffmpeg is None and not args.url_only:
+        print("ffmpeg not used: pure-Python download (VOD -> MP4, MPEG-TS live -> .ts).", file=sys.stderr)
 
     tokens = obtain_tokens(Session(proxy, debug=args.debug), args.user, args.password, args.relogin)
     media = fetch_media(Session(proxy, debug=args.debug), media_id, tokens)
@@ -672,15 +980,44 @@ def main() -> int:
     master = Session(proxy).request("GET", master_url, headers=STREAM_HEADERS)
     if master.status != 200:
         raise RuntimeError(f"HLS manifest returned HTTP {master.status}: {master.body[:200]!r}")
-    relay = HlsRelay(proxy, master_url, build_best_master(master_url, master.text()))
+    streams = select_streams(master_url, master.text())
+    relay = HlsRelay(proxy, master_url, streams.filtered_master)
     relay.start()
     print_player_banner(relay, proxy)
     try:
         if args.url_only:
             return wait_forever()
-        return run_ffmpeg(args.ffmpeg, relay.playlist_url, output, live, args.duration)
+        if ffmpeg:
+            return run_ffmpeg(ffmpeg, relay.playlist_url, output, live, args.duration)
+        session = Session(proxy, timeout=60.0)
+        if live:
+            if streams.audio_url:
+                raise RuntimeError("Live stream with separate audio rendition needs ffmpeg.")
+            written = record_live(session, streams.video_url, output, args.duration, args.from_start)
+        else:
+            video = fetch_media_playlist(session, streams.video_url)
+            audio = fetch_media_playlist(session, streams.audio_url) if streams.audio_url else None
+            if args.duration:
+                video, audio = truncate_playlists(video, audio, args.duration)
+            written = download_vod(session, video, audio, output)
+        print(f"Saved {written} ({written.stat().st_size / (1 << 20):.1f} MiB)", file=sys.stderr)
+        return 0
     finally:
         relay.shutdown()
+
+
+def truncate_playlists(video: MediaPlaylist, audio: MediaPlaylist | None, seconds: int) -> tuple[MediaPlaylist, MediaPlaylist | None]:
+    def cut(playlist: MediaPlaylist) -> MediaPlaylist:
+        kept: list[Segment] = []
+        total = 0.0
+        for segment in playlist.segments:
+            if total >= seconds:
+                break
+            kept.append(segment)
+            total += segment.duration
+        return MediaPlaylist(playlist.init_url, kept, playlist.target_duration, playlist.ended)
+
+    return cut(video), (cut(audio) if audio else None)
 
 
 if __name__ == "__main__":

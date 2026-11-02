@@ -4,8 +4,9 @@ Tools for downloading ruutu.fi (Sanoma / Nelonen Media) videos and live streams 
 
 ## Files
 
-- `ruutu_dl.py` – main script. Pure stdlib + external `ffmpeg`. Sanoma SSO login, token cache and renewal, media API,
-  HLS master filtering, local HLS relay, ffmpeg remux. Own SOCKS5 client on top of `http.client` (urllib has no SOCKS).
+- `ruutu_dl.py` – main script. Pure stdlib, ffmpeg optional. Sanoma SSO login, token cache and renewal, media API,
+  HLS master filtering, local HLS relay, pure-Python fMP4 merge (VOD) and TS concatenation (live), ffmpeg remux when
+  available. Own SOCKS5 client on top of `http.client` (urllib has no SOCKS).
 - `rec.sh` – alternative live recorder: streamlink + ffmpeg to fragmented MP4. Args: `M3U8_URL [NAME]`.
 - `*.mp4`, `*.ts` – recordings, never commit.
 
@@ -23,7 +24,11 @@ python3 ruutu_dl.py [--proxy socks5://127.0.0.1:7654] [-u LOGIN -p PASSWORD] htt
 - URL may be `/video/<id>`, `/stream/<id>` (live events) or a bare `<id>`.
 - `--url-only` prints the manifest URL and keeps the local HLS relay running for a player. The relay also runs during
   downloads (watch while recording).
-- `--duration N` stops after N seconds (ffmpeg `-t`). Live: `mediaType` ends with `_live`.
+- `--duration N` stops after N seconds (ffmpeg `-t`, or segment-granular in the Python path). Live: `mediaType` ends with `_live`.
+- Download paths: ffmpeg found (and no `--no-ffmpeg`) → ffmpeg reads the relay playlist, writes MP4 for VOD and live.
+  No ffmpeg → VOD fMP4 tracks merged in Python into MP4 (`InitSegment`, `build_moov`, `rewrite_fragment`), live MPEG-TS
+  appended into `.ts` (`record_live`, live edge by default, `--from-start` for the whole EVENT playlist). Output suffix is
+  forced to match the container. Live with a separate audio rendition and no ffmpeg is rejected.
 - All user-facing messages are in English.
 
 Tooling: `uv tool install streamlink mitmproxy pproxy` (binaries in `~/.local/bin`), ffmpeg from Homebrew.
@@ -48,6 +53,7 @@ its cookie worked, but may start returning 403.
 - HLS/DASH URLs embed an HS256 JWT in the path with `path`, `ip` (client IP that called the media API), `nbf`/`exp` (24 h). Downloads must come from the same IP as the media API call, hence one proxy setting for the whole script.
 - `streamUrls.http` (progressive MP4, 3000 kbps) returns 403 both directly and through the tunnel, so it is not used.
 - VOD master playlists (Unified Streaming) keep audio in a separate `#EXT-X-MEDIA:TYPE=AUDIO` rendition referenced by `AUDIO="..."` on the variant; live masters (AWS Elemental) have muxed audio. The script builds a filtered master with the best variant plus its audio group and drops subtitles.
+- Segment formats: VOD = CMAF fMP4 (`#EXT-X-MAP` init + `.m4s`, one track per playlist, `styp`/`sidx`/`moof`/`mdat` per segment); live = MPEG-TS (`index_N.ts`, 6 s, muxed audio). `trun` data offsets are relative to `moof`, so in-place `tfhd`/`mfhd` rewrites are safe; `sidx` carries a track reference and is dropped instead of patched.
 
 ### Geoblock
 - `GET https://geoblock.nm-ovp.nelonenmedia.fi/geoblock` returns XML `<geoblock status="true">...</geoblock>` for hosting IP ranges (e.g. Hetzner) and an empty result for residential IPs. Enforced only in the browser player; the media API and CDN do not check it.

@@ -2,17 +2,20 @@
 
 Download videos and record live streams from [ruutu.fi](https://www.ruutu.fi) (Sanoma / Nelonen Media) to MP4.
 
-Pure Python standard library. The only external dependency is [ffmpeg](https://ffmpeg.org/). No `yt-dlp`, no
-`requests`, no `PySocks`. Optional SOCKS5 tunnel support (for example `ssh -D`) is implemented from scratch,
-including a local HLS relay so ffmpeg and players like VLC can read the stream through the tunnel without any
-proxy configuration.
+Pure Python standard library, zero required dependencies. No `yt-dlp`, no `requests`, no `PySocks`.
+[ffmpeg](https://ffmpeg.org/) is optional: without it, VOD is still saved as MP4 (the fragmented MP4 tracks are
+merged in Python) and live MPEG-TS streams are saved as `.ts`; with it, live streams are remuxed to MP4 too.
+Optional SOCKS5 tunnel support (for example `ssh -D`) is implemented from scratch, including a local HLS relay so
+ffmpeg and players like VLC can read the stream through the tunnel without any proxy configuration.
 
 ## Features
 
 - Logs in through Sanoma SSO with your Ruutu account, caches the tokens and renews them without asking for the password again.
 - Resolves `/video/<id>`, `/stream/<id>` (live events) or a bare media ID.
-- Picks the highest-bandwidth HLS variant together with its audio rendition and remuxes to MP4 without re-encoding.
-- Live streams: records until `Ctrl+C` or for `--duration N` seconds. ffmpeg finalizes the file cleanly on interrupt.
+- Picks the highest-bandwidth HLS variant together with its audio rendition; no re-encoding anywhere.
+- Without ffmpeg: VOD (CMAF/fMP4) video and audio tracks are merged into a single MP4 in pure Python; live MPEG-TS is
+  concatenated into a `.ts` file. With ffmpeg: everything becomes MP4.
+- Live streams: records until `Ctrl+C` or for `--duration N` seconds, from the live edge or `--from-start`.
 - `--proxy socks5://host:port` routes everything through a SOCKS5 tunnel. Stream tokens are bound to the IP that
   requested them, so API calls and downloads must leave from the same address; the script takes care of that.
 - `--url-only` prints the manifest URL and keeps the local HLS relay running (`http://127.0.0.1:<port>/playlist.m3u8`)
@@ -23,8 +26,8 @@ proxy configuration.
 ## Requirements
 
 - Python 3.11+
-- ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`, …)
-- For `rec.sh` only: [streamlink](https://streamlink.github.io/)
+- Optional: ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`, …) for live streams as MP4 instead of `.ts`
+- For `rec.sh` only: [streamlink](https://streamlink.github.io/) and ffmpeg
 
 ## Usage
 
@@ -49,10 +52,12 @@ All options:
 | `-u`, `-p` | Ruutu / Sanoma account credentials (or `RUUTU_USER`, `RUUTU_PASS`). Needed only until tokens are cached. |
 | `-o FILE` | Output file (default `ruutu-<id>.mp4` in the current directory). |
 | `--proxy` | SOCKS5 proxy: `socks5://host:port` or `host:port` (or `RUUTU_PROXY`). Default: direct connection. |
-| `--duration N` | Stop after N seconds (mainly for live streams). |
+| `--duration N` | Stop after N seconds (live: wall clock of media; VOD: first N seconds). |
+| `--from-start` | Live: start from the beginning of the playlist instead of the live edge. |
 | `--url-only` | Print the manifest URL and serve the local relay; do not download. |
 | `--relogin` | Ignore cached tokens and log in again. |
-| `--ffmpeg PATH` | ffmpeg binary (default: found on `PATH`). |
+| `--ffmpeg PATH` | ffmpeg binary (default: found on `PATH`, used when present). |
+| `--no-ffmpeg` | Force the pure-Python path even if ffmpeg is installed. |
 | `--debug` | Print status and key headers of every HTTP response. |
 
 Tokens are stored in `~/.ruutu-dl/auth.json` (mode 600). The access token lives 24 hours and is renewed with the
@@ -75,7 +80,10 @@ A small alternative for live channels using streamlink and ffmpeg directly:
 - HLS URLs carry a signed token bound to the client IP and valid for 24 hours.
 - The script fetches the master playlist, keeps only the best variant plus its `#EXT-X-MEDIA` audio rendition
   (VOD ships audio separately) and serves that through a local HTTP relay that rewrites every URI to itself and
-  fetches segments through the tunnel. ffmpeg reads from the relay and writes MP4 with `-c copy`.
+  fetches segments through the tunnel. With ffmpeg present, ffmpeg reads from the relay and writes MP4 with `-c copy`.
+- Without ffmpeg, VOD segments (CMAF `.m4s` with an `#EXT-X-MAP` init segment) are downloaded in parallel and merged:
+  the two init segments become one `moov` with two `trak`s and a shared `mvex`, fragments keep their `moof`/`mdat`
+  pairs with rewritten `tfhd` track IDs and `mfhd` sequence numbers. Live MPEG-TS segments are simply appended.
 - VLC on macOS cannot be pointed at a SOCKS proxy from the command line, which is why the relay exists at all.
 
 ## Notes
