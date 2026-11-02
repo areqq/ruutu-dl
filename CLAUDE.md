@@ -7,7 +7,6 @@ Tools for downloading ruutu.fi (Sanoma / Nelonen Media) videos and live streams 
 - `ruutu_dl.py` – main script. Pure stdlib, ffmpeg optional. Sanoma SSO login, token cache and renewal, media API,
   HLS master filtering, local HLS relay, pure-Python fMP4 merge (VOD) and TS concatenation (live), ffmpeg remux when
   available. Own SOCKS5 client on top of `http.client` (urllib has no SOCKS).
-- `rec.sh` – alternative live recorder: streamlink + ffmpeg to fragmented MP4. Args: `M3U8_URL [NAME]`.
 - `*.mp4`, `*.ts` – recordings, never commit.
 
 ## Usage
@@ -31,7 +30,7 @@ python3 ruutu_dl.py [--proxy socks5://127.0.0.1:7654] [-u LOGIN -p PASSWORD] htt
   forced to match the container. Live with a separate audio rendition and no ffmpeg is rejected.
 - All user-facing messages are in English.
 
-Tooling: `uv tool install streamlink mitmproxy pproxy` (binaries in `~/.local/bin`), ffmpeg from Homebrew.
+Tooling for traffic analysis: `uv tool install mitmproxy pproxy` (binaries in `~/.local/bin`), ffmpeg from Homebrew.
 
 ## How ruutu.fi works (reverse engineered from captured traffic, November 2026)
 
@@ -66,7 +65,7 @@ its cookie worked, but may start returning 403.
 
 ## Live recording notes
 - yt-dlp was dropped: for live HLS it delegates to ffmpeg anyway, and its native downloader cannot do live. ffmpeg reading from the relay covers VOD and live alike.
-- `rec.sh` alternative: streamlink supports `--http-proxy socks5h://...` natively; piping to `ffmpeg -c copy -movflags +frag_keyframe+empty_moov` gives an MP4 that survives Ctrl+C.
+- If a streamlink-based recorder is ever needed again: it supports `--http-proxy socks5h://...` natively, and piping to `ffmpeg -c copy -movflags +frag_keyframe+empty_moov` gives an MP4 that survives Ctrl+C.
 
 ## Traffic analysis
 - Chrome with a separate profile: `open -na "Google Chrome" --args --proxy-server="http://127.0.0.1:8080" --ignore-certificate-errors-spki-list=<mitmproxy CA SPKI> --user-data-dir=~/.chrome-socks-7654`.

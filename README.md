@@ -27,7 +27,6 @@ ffmpeg and players like VLC can read the stream through the tunnel without any p
 
 - Python 3.11+
 - Optional: ffmpeg (`brew install ffmpeg`, `apt install ffmpeg`, …) for live streams as MP4 instead of `.ts`
-- For `rec.sh` only: [streamlink](https://streamlink.github.io/) and ffmpeg
 
 ## Usage
 
@@ -62,14 +61,6 @@ All options:
 
 Tokens are stored in `~/.ruutu-dl/auth.json` (mode 600). The access token lives 24 hours and is renewed with the
 refresh token (valid for a year) through the same endpoint the web player uses.
-
-### rec.sh
-
-A small alternative for live channels using streamlink and ffmpeg directly:
-
-```bash
-./rec.sh "<hls-index.m3u8 url with token>" my-recording
-```
 
 ## How it works
 
